@@ -10,15 +10,15 @@ class ConnectionClosed(Exception):
     pass
 
 class BPOWClient():
-    NANO_DIFFICULTY_CONST = 'ffffffc000000000'
+    KSHS_DIFFICULTY_CONST = 'ffffffc000000000'
 
-    def __init__(self, bpow_url : str, key : str, app : web.Application, force_nano_difficulty: bool = False):
+    def __init__(self, bpow_url : str, key : str, app : web.Application, force_kakitu_difficulty: bool = False):
         self.bpow_url = bpow_url
         self.key = key
         self.id = 0
         self.app = app
         self.ws = None # None when socket is closed
-        self.difficulty = 64 if force_nano_difficulty else 1
+        self.difficulty = 64 if force_kakitu_difficulty else 1
         self.bpow_client = GraphQLClient(
             endpoint=bpow_url,
             headers={"Authorization": f"{key}"},

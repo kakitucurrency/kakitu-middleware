@@ -25,15 +25,15 @@ current_loop = asyncio.get_event_loop_policy().get_event_loop()
 
 # Configuration arguments
 
-parser = argparse.ArgumentParser(description="Betsy Work Distributer, Callback Forwarder, Work Precacher (NANO/BANANO)")
-parser.add_argument('--host', type=str, help='Host for betsy to listen on', default='127.0.0.1')
-parser.add_argument('--port', type=int, help='Port for betsy to listen on', default='5555')
+parser = argparse.ArgumentParser(description="Kakitu Middleware Work Distributer, Callback Forwarder, Work Precacher (KSHS)")
+parser.add_argument('--host', type=str, help='Host for kakitu-middleware to listen on', default='127.0.0.1')
+parser.add_argument('--port', type=int, help='Port for kakitu-middleware to listen on', default='5555')
 parser.add_argument('--node-url', type=str, help='Node RPC Connection String')
 parser.add_argument('--log-file', type=str, help='Log file location')
 parser.add_argument('--work-urls', nargs='*', help='Work servers to send work too (NOT for dPOW')
 parser.add_argument('--callbacks',nargs='*', help='Endpoints to forward node callbacks to')
-parser.add_argument('--bpow-url', type=str, help='BoomPow (bPow) HTTP URL', default='https://boompow.banano.cc/graphql')
-parser.add_argument('--bpow-nano-difficulty', action='store_true', help='Use NANO difficulty with BoomPow (If using for NANO instead of BANANO)', default=False)
+parser.add_argument('--bpow-url', type=str, help='BoomPow (bPow) HTTP URL', default='https://boompow.kakitu.org/graphql')
+parser.add_argument('--bpow-kakitu-difficulty', action='store_true', help='Use KSHS difficulty with BoomPow (If using for Kakitu instead of legacy networks)', default=False)
 parser.add_argument('--precache', action='store_true', help='Enables work precaching if specified (does not apply to dPOW or bPow)', default=False)
 parser.add_argument('--debug', action='store_true', help='Runs in debug mode if specified', default=False)
 options = parser.parse_args()
@@ -66,24 +66,24 @@ if NODE_CONNSTR is not None:
         parser.print_help()
         sys.exit(1)
 
-# For Banano's BoomPow
+# For Kakitu's BoomPow
 BPOW_URL = options.bpow_url
 BPOW_KEY = os.getenv('BPOW_KEY', None)
 BPOW_ENABLED = BPOW_KEY is not None
-BPOW_FOR_NANO = options.bpow_nano_difficulty
+BPOW_FOR_KAKITU = options.bpow_kakitu_difficulty
 
 work_futures = dict()
 
 async def init_bpow(app):
     if BPOW_ENABLED:
-        app['bpow'] = BPOWClient(BPOW_URL,BPOW_KEY, app,force_nano_difficulty=BPOW_FOR_NANO)
+        app['bpow'] = BPOWClient(BPOW_URL,BPOW_KEY, app,force_kakitu_difficulty=BPOW_FOR_KAKITU)
     else:
         app['bpow'] = None
 
 DEBUG = options.debug
 
 # Constants
-PRECACHE_Q_KEY = 'betsy_pcache_q'
+PRECACHE_Q_KEY = 'kakitu_middleware_pcache_q'
 
 ### PEER-related functions
 
@@ -122,7 +122,7 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
         request['difficulty'] = difficulty
     tasks = []
     for p in WORK_URLS:
-        tasks.append(asyncio.create_task(json_post(p, request, app=app)))                               
+        tasks.append(asyncio.create_task(json_post(p, request, app=app)))
     if BPOW_ENABLED and not precache:
         tasks.append(asyncio.create_task(app['bpow'].request_work(hash, difficulty)))
 
@@ -206,7 +206,7 @@ async def rpc(request):
         work = await request.app['redis'].get(f"{requestjson['hash']}:{difficulty}" if difficulty is not None else requestjson['hash'])
         if work is not None:
             # Validate
-            test_difficulty = difficulty if difficulty is not None else BPOWClient.NANO_DIFFICULTY_CONST if BPOW_FOR_NANO else 'fffffe0000000000'
+            test_difficulty = difficulty if difficulty is not None else BPOWClient.KSHS_DIFFICULTY_CONST if BPOW_FOR_KAKITU else 'fffffe0000000000'
             try:
                 nanolib.validate_work(requestjson['hash'], work, difficulty=test_difficulty)
                 return web.json_response({"work":work})

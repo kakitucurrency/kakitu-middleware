@@ -1,23 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: betsy-nano
-  namespace: betsy
+  name: kakitu-middleware-kshs
+  namespace: kakitu-middleware
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: betsy-nano
+      app: kakitu-middleware-kshs
   template:
     metadata:
       labels:
-        app: betsy-nano
+        app: kakitu-middleware-kshs
     spec:
       containers:
-      - name: betsy-nano
-        image: bananocoin/betsy:2.0.0
+      - name: kakitu-middleware-kshs
+        image: kakitucurrency/kakitu-middleware:2.0.0
         command: ["/bin/bash", "-c"]
-        args: ["python main.py --host 0.0.0.0 --port 5555 --callbacks http://graham-nano.graham-nano:11337/callback http://graham-banano.graham-nano:11337/callback http://natrium-server.natrium:3000/callback --bpow-nano-difficulty"]
+        args: ["python main.py --host 0.0.0.0 --port 5555 --callbacks http://graham-kakitu.graham-kakitu:11337/callback http://graham-kakitu2.graham-kakitu:11337/callback http://kakitu-server.kakitu:3000/callback --bpow-kakitu-difficulty"]
         ports:
         - containerPort: 5555
           name: api
@@ -25,18 +25,18 @@ spec:
           - name: REDIS_HOST
             value: redis.redis
           - name: REDIS_DB
-            value: "1"  
+            value: "1"
           - name: BPOW_KEY
             valueFrom:
               secretKeyRef:
-                name: betsy
+                name: kakitu-middleware
                 key: bpow_key
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: betsy-nano
-  namespace: betsy
+  name: kakitu-middleware-kshs
+  namespace: kakitu-middleware
 spec:
   type: ClusterIP
   ports:
@@ -44,13 +44,13 @@ spec:
     targetPort: 5555
     name: api
   selector:
-    app: betsy-nano
+    app: kakitu-middleware-kshs
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: betsy-nano-nodeport
-  namespace: betsy
+  name: kakitu-middleware-kshs-nodeport
+  namespace: kakitu-middleware
 spec:
   type: NodePort
   ports:
@@ -59,4 +59,4 @@ spec:
     nodePort: 30755
     targetPort: 5555
   selector:
-    app: betsy-nano
+    app: kakitu-middleware-kshs

@@ -1,23 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: betsy-banano
-  namespace: betsy
+  name: kakitu-middleware-kakitu
+  namespace: kakitu-middleware
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: betsy-banano
+      app: kakitu-middleware-kakitu
   template:
     metadata:
       labels:
-        app: betsy-banano
+        app: kakitu-middleware-kakitu
     spec:
       containers:
-      - name: betsy-banano
-        image: bananocoin/betsy:2.0.0
+      - name: kakitu-middleware-kakitu
+        image: kakitucurrency/kakitu-middleware:2.0.0
         command: ["/bin/bash", "-c"]
-        args: ["python main.py --host 0.0.0.0 --port 5555 --callbacks http://monkeytalks.monkeytalks:5000/callback http://graham-bbet.graham-banano:11337/callback http://bananobot.graham-banano:11337/callback http://kalium-server.kalium:3000/callback"]
+        args: ["python main.py --host 0.0.0.0 --port 5555 --callbacks http://monkeytalks.monkeytalks:5000/callback http://graham-kakitu.graham-kakitu:11337/callback http://kakitubot.graham-kakitu:11337/callback http://kalium-server.kalium:3000/callback"]
         ports:
         - containerPort: 5555
           name: api
@@ -25,18 +25,18 @@ spec:
           - name: REDIS_HOST
             value: redis.redis
           - name: REDIS_DB
-            value: "0"  
+            value: "0"
           - name: BPOW_KEY
             valueFrom:
               secretKeyRef:
-                name: betsy
+                name: kakitu-middleware
                 key: bpow_key
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: betsy-banano
-  namespace: betsy
+  name: kakitu-middleware-kakitu
+  namespace: kakitu-middleware
 spec:
   type: ClusterIP
   ports:
@@ -44,13 +44,13 @@ spec:
     targetPort: 5555
     name: api
   selector:
-    app: betsy-banano
+    app: kakitu-middleware-kakitu
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: betsy-banano-nodeport
-  namespace: betsy
+  name: kakitu-middleware-kakitu-nodeport
+  namespace: kakitu-middleware
 spec:
   type: NodePort
   ports:
@@ -59,4 +59,4 @@ spec:
     nodePort: 30756
     targetPort: 5555
   selector:
-    app: betsy-banano
+    app: kakitu-middleware-kakitu
