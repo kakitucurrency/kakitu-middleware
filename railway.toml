@@ -2,6 +2,6 @@
 builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python main.py --host 0.0.0.0 --port $PORT --bpow-kakitu-difficulty"
+startCommand = "python main.py --host 0.0.0.0 --port ${PORT:-8080} --bpow-kakitu-difficulty"
 healthcheckPath = "/stats"
 restartPolicyType = "ON_FAILURE"
