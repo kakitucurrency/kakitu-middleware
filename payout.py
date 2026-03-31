@@ -72,10 +72,10 @@ def _build_block(
         raise PayoutError("nanolib not available — cannot build block on this platform")
 
 
-async def _rpc(node_url: str, payload: dict) -> dict:
+async def _rpc(node_url: str, payload: dict, timeout_secs: int = 10) -> dict:
     """Single RPC call to the Kakitu node."""
     url = node_url if node_url.startswith('http') else f'http://{node_url}'
-    timeout = ClientTimeout(total=10)
+    timeout = ClientTimeout(total=timeout_secs)
     async with ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload) as resp:
             return await resp.json(content_type=None)
@@ -121,7 +121,7 @@ async def send_reward(
     work_resp = await _rpc(node_url, {
         'action': 'work_generate',
         'hash': frontier,
-    })
+    }, timeout_secs=120)
     if 'work' not in work_resp:
         raise PayoutError(f"work_generate failed: {work_resp}")
 
