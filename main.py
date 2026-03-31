@@ -311,10 +311,11 @@ async def handle_worker_ws(request):
             if msg.type == WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
+                    worker_obj = worker_pool.workers.get(ws_id)
                     won = await worker_pool.submit(ws_id, data['hash'], data['work'])
-                    if won:
+                    if won and worker_obj is not None:
                         asyncio.ensure_future(
-                            pay_and_notify(ws_id, data['hash'])
+                            pay_and_notify(worker_obj, data['hash'])
                         )
                 except Exception as e:
                     log.server_logger.warning(f"Bad message from {ws_id}: {e}")
@@ -327,12 +328,10 @@ async def handle_worker_ws(request):
     return ws
 
 
-async def pay_and_notify(ws_id: str, hash: str):
-    """Issue payout and notify worker. Fire-and-forget via ensure_future."""
-    worker = worker_pool.workers.get(ws_id)
-    if worker is None:
-        return
-
+async def pay_and_notify(worker, hash: str):
+    """Issue payout and notify worker. Fire-and-forget via ensure_future.
+    worker is captured at submission time so payout works even if the worker
+    has since disconnected."""
     if not WORKER_PAYOUTS_ENABLED:
         # Track work even in no-payout mode (but no KSHS credited)
         stats.record_completion(worker, 0)
