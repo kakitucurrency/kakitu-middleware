@@ -31,7 +31,7 @@ asyncio.set_event_loop(current_loop)
 
 parser = argparse.ArgumentParser(description="Kakitu Middleware Work Distributer, Callback Forwarder, Work Precacher (KSHS)")
 parser.add_argument('--host', type=str, help='Host for kakitu-middleware to listen on', default='127.0.0.1')
-parser.add_argument('--port', type=int, help='Port for kakitu-middleware to listen on', default='5555')
+parser.add_argument('--port', type=int, help='Port for kakitu-middleware to listen on', default=int(os.environ.get('PORT', '5555')))
 parser.add_argument('--node-url', type=str, help='Node RPC Connection String')
 parser.add_argument('--log-file', type=str, help='Log file location')
 parser.add_argument('--work-urls', nargs='*', help='Work servers to send work too (NOT for dPOW')
