@@ -47,7 +47,7 @@ class WorkerPool:
         if not self.workers:
             return None
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending[hash] = future
 
@@ -90,8 +90,12 @@ class WorkerPool:
             logger.warning(f"Invalid work from {ws_id}: {e}")
             return False
 
-        future.set_result(work)
-        return True
+        try:
+            future.set_result(work)
+            return True
+        except asyncio.InvalidStateError:
+            logger.debug(f"Future already resolved for hash {hash}")
+            return False
 
     @property
     def count(self) -> int:
