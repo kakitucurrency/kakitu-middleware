@@ -24,7 +24,8 @@ from payout import send_reward, PayoutError
 
 uvloop.install()
 
-current_loop = asyncio.get_event_loop_policy().get_event_loop()
+current_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(current_loop)
 
 # Configuration arguments
 
