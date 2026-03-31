@@ -4,3 +4,5 @@ uvloop
 python-dotenv
 nanolib
 aiographql-client
+pytest
+pytest-asyncio
