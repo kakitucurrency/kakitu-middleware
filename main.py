@@ -18,6 +18,9 @@ import nanolib
 
 from bpow_client import BPOWClient, ConnectionClosed
 from aiographql.client import GraphQLResponse
+from stats import Stats
+from worker_hub import WorkerPool
+from payout import send_reward, PayoutError
 
 uvloop.install()
 
@@ -72,6 +75,15 @@ BPOW_KEY = os.getenv('BPOW_KEY', None)
 BPOW_ENABLED = BPOW_KEY is not None
 BPOW_FOR_KAKITU = options.bpow_kakitu_difficulty
 
+# Worker hub configuration
+WORKER_FUND_SEED = os.getenv('WORKER_FUND_SEED', None)
+WORKER_FUND_ADDRESS = os.getenv('WORKER_FUND_ADDRESS', None)
+WORK_REWARD_KSHS = float(os.getenv('WORK_REWARD_KSHS', '0.01'))
+WORKER_PAYOUTS_ENABLED = WORKER_FUND_SEED is not None and WORKER_FUND_ADDRESS is not None
+
+stats = Stats()
+worker_pool = WorkerPool(timeout=30.0)
+
 work_futures = dict()
 
 async def init_bpow(app):
@@ -120,6 +132,21 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
     request['reward'] = reward
     if difficulty is not None:
         request['difficulty'] = difficulty
+    # Try connected workers first
+    if not precache and worker_pool.count > 0:
+        worker_result = await worker_pool.dispatch(hash, difficulty or 'ffffffc000000000')
+        if worker_result is not None:
+            try:
+                await redis.set(
+                    f"{hash}:{difficulty}" if difficulty is not None else hash,
+                    worker_result,
+                    expire=600000
+                )
+            except Exception:
+                pass
+            return {'work': worker_result}
+
+    # Fallback: work peers + BoomPow
     tasks = []
     for p in WORK_URLS:
         tasks.append(asyncio.create_task(json_post(p, request, app=app)))
@@ -253,6 +280,84 @@ async def callback(request):
 
 ### APP setup
 
+async def handle_worker_ws(request):
+    """WebSocket endpoint for worker connections at /worker/ws."""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    # Wait for registration message
+    try:
+        msg = await ws.receive_json()
+    except Exception:
+        await ws.close(code=4000, message=b'expected JSON registration message')
+        return ws
+
+    address = msg.get('kshs_address', '')
+    if not address.startswith('kshs_'):
+        await ws.close(code=4001, message=b'invalid kshs_ address')
+        return ws
+
+    ws_id = await worker_pool.add(ws, address)
+    stats.connected_workers = worker_pool.count
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    won = await worker_pool.submit(ws_id, data['hash'], data['work'])
+                    if won:
+                        asyncio.ensure_future(
+                            pay_and_notify(ws_id, data['hash'], data['work'])
+                        )
+                except Exception as e:
+                    log.server_logger.warning(f"Bad message from {ws_id}: {e}")
+            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                break
+    finally:
+        await worker_pool.remove(ws_id)
+        stats.connected_workers = worker_pool.count
+
+    return ws
+
+
+async def pay_and_notify(ws_id: str, hash: str, work: str):
+    """Issue payout and notify worker. Fire-and-forget via ensure_future."""
+    worker = worker_pool.workers.get(ws_id)
+    if worker is None:
+        return
+
+    stats.record_completion(worker, WORK_REWARD_KSHS)
+
+    if not WORKER_PAYOUTS_ENABLED:
+        return
+
+    try:
+        tx_hash = await send_reward(
+            node_url=NODE_CONNSTR,
+            fund_seed=WORKER_FUND_SEED,
+            fund_address=WORKER_FUND_ADDRESS,
+            destination=worker.kshs_address,
+            amount_kshs=WORK_REWARD_KSHS,
+        )
+        try:
+            await worker.ws.send_json({
+                'action': 'paid',
+                'hash': hash,
+                'amount': f'{WORK_REWARD_KSHS:.6f}',
+                'tx_hash': tx_hash,
+            })
+        except Exception:
+            pass
+    except PayoutError as e:
+        log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
+
+
+async def handle_stats(request):
+    """GET /stats — public network statistics."""
+    return web.json_response(stats.to_dict())
+
+
 async def get_app():
     async def close_redis(app):
         """Close redis connection"""
@@ -299,6 +404,8 @@ async def get_app():
     app['failover_dt'] = None
     app.add_routes([web.post('/', rpc)])
     app.add_routes([web.post('/callback', callback)])
+    app.add_routes([web.get('/worker/ws', handle_worker_ws)])
+    app.add_routes([web.get('/stats', handle_stats)])
     app.on_startup.append(open_redis)
     app.on_startup.append(init_queue)
     app.on_startup.append(init_bpow)
