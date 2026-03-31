@@ -9,7 +9,7 @@ import logging
 import json
 import aioredis
 import datetime
-from aiohttp import ClientSession, log, web
+from aiohttp import ClientSession, WSMsgType, log, web
 from logging.handlers import TimedRotatingFileHandler, WatchedFileHandler
 import uvloop
 import sys
@@ -79,7 +79,11 @@ BPOW_FOR_KAKITU = options.bpow_kakitu_difficulty
 WORKER_FUND_SEED = os.getenv('WORKER_FUND_SEED', None)
 WORKER_FUND_ADDRESS = os.getenv('WORKER_FUND_ADDRESS', None)
 WORK_REWARD_KSHS = float(os.getenv('WORK_REWARD_KSHS', '0.01'))
-WORKER_PAYOUTS_ENABLED = WORKER_FUND_SEED is not None and WORKER_FUND_ADDRESS is not None
+WORKER_PAYOUTS_ENABLED = (
+    WORKER_FUND_SEED is not None
+    and WORKER_FUND_ADDRESS is not None
+    and NODE_CONNSTR is not None
+)
 
 stats = Stats()
 worker_pool = WorkerPool(timeout=30.0)
@@ -287,7 +291,7 @@ async def handle_worker_ws(request):
 
     # Wait for registration message
     try:
-        msg = await ws.receive_json()
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=10.0)
     except Exception:
         await ws.close(code=4000, message=b'expected JSON registration message')
         return ws
@@ -302,17 +306,17 @@ async def handle_worker_ws(request):
 
     try:
         async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
+            if msg.type == WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
                     won = await worker_pool.submit(ws_id, data['hash'], data['work'])
                     if won:
                         asyncio.ensure_future(
-                            pay_and_notify(ws_id, data['hash'], data['work'])
+                            pay_and_notify(ws_id, data['hash'])
                         )
                 except Exception as e:
                     log.server_logger.warning(f"Bad message from {ws_id}: {e}")
-            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+            elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                 break
     finally:
         await worker_pool.remove(ws_id)
@@ -321,25 +325,30 @@ async def handle_worker_ws(request):
     return ws
 
 
-async def pay_and_notify(ws_id: str, hash: str, work: str):
+async def pay_and_notify(ws_id: str, hash: str):
     """Issue payout and notify worker. Fire-and-forget via ensure_future."""
     worker = worker_pool.workers.get(ws_id)
     if worker is None:
         return
 
-    stats.record_completion(worker, WORK_REWARD_KSHS)
+    # Always record work completion (but not kshs amount — only on actual payout)
+    worker.work_completed += 1
 
     if not WORKER_PAYOUTS_ENABLED:
         return
+
+    addr = worker.kshs_address
 
     try:
         tx_hash = await send_reward(
             node_url=NODE_CONNSTR,
             fund_seed=WORKER_FUND_SEED,
             fund_address=WORKER_FUND_ADDRESS,
-            destination=worker.kshs_address,
+            destination=addr,
             amount_kshs=WORK_REWARD_KSHS,
         )
+        # Only record payout after actual success
+        stats.record_completion(worker, WORK_REWARD_KSHS)
         try:
             await worker.ws.send_json({
                 'action': 'paid',
