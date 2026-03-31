@@ -51,13 +51,15 @@ def _build_block(
     """
     try:
         import nanolib
+        # nanolib.Block.link expects a 64-char hex public key, not an account address
+        dest_pubkey_hex = nanolib.get_account_public_key(account_id=_kshs_to_nano(destination))
         block = nanolib.Block(
             block_type='state',
             account=_kshs_to_nano(fund_address),
             previous=frontier,
             representative=_kshs_to_nano(representative),
             balance=new_balance,
-            link=_kshs_to_nano(destination),
+            link=dest_pubkey_hex,
         )
         block.sign(private_key_hex)
         block.work = work
