@@ -366,7 +366,7 @@ async def handle_stats(request):
     """GET /stats — public network statistics."""
     data = stats.to_dict()
     data['work_reward_kshs'] = f'{WORK_REWARD_KSHS:.6f}'
-    return web.json_response(data)
+    return web.json_response(data, headers={'Access-Control-Allow-Origin': '*'})
 
 
 async def handle_admin_fund(request):
