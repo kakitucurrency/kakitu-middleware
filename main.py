@@ -335,7 +335,7 @@ async def pay_and_notify(ws_id: str, hash: str):
 
     if not WORKER_PAYOUTS_ENABLED:
         # Track work even in no-payout mode (but no KSHS credited)
-        worker.work_completed += 1
+        stats.record_completion(worker, 0)
         return
 
     try:
@@ -360,7 +360,7 @@ async def pay_and_notify(ws_id: str, hash: str):
     except PayoutError as e:
         log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
         # Still credit the work even if payout failed
-        worker.work_completed += 1
+        stats.record_completion(worker, 0)
 
 
 async def handle_stats(request):
