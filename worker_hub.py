@@ -5,7 +5,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-import nanolib
+try:
+    import nanolib
+except ImportError:
+    nanolib = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +84,8 @@ class WorkerPool:
             return False
 
         try:
-            nanolib.validate_work(hash, work)
+            if nanolib is not None:
+                nanolib.validate_work(hash, work)
         except Exception as e:
             logger.warning(f"Invalid work from {ws_id}: {e}")
             return False

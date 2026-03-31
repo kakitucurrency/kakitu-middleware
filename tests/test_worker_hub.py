@@ -1,6 +1,5 @@
 import asyncio
 import pytest
-import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from worker_hub import WorkerPool, Worker
 
@@ -40,7 +39,9 @@ async def test_dispatch_sends_task_to_workers():
         await asyncio.sleep(0.01)
         await pool.submit(ws_id, 'HASH123', 'aabbccdd11223344')
 
-    with patch('worker_hub.nanolib.validate_work', return_value=None):
+    mock_nanolib = MagicMock()
+    mock_nanolib.validate_work.return_value = None
+    with patch('worker_hub.nanolib', mock_nanolib):
         asyncio.create_task(fake_submit())
         result = await pool.dispatch('HASH123', 'ffffffc000000000')
 
