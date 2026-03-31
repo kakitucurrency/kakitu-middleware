@@ -62,8 +62,8 @@ NODE_CONNSTR = options.node_url or os.getenv('NODE_URL', None)
 NODE_FALLBACK = False
 if NODE_CONNSTR is not None:
     try:
-        NODE_URL = options.node_url.split(':')[0]
-        NODE_PORT = options.node_url.split(':')[1]
+        NODE_URL = NODE_CONNSTR.split(':')[0]
+        NODE_PORT = NODE_CONNSTR.split(':')[1]
         NODE_FALLBACK = True
     except Exception:
         print(f"Invalid node connection string, should be url:port, not {NODE_CONNSTR}")
