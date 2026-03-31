@@ -26,7 +26,8 @@ class Worker:
 class WorkerPool:
     def __init__(self, timeout: float = 30.0):
         self.workers: Dict[str, Worker] = {}
-        self._pending: Dict[str, asyncio.Future] = {}
+        self._pending: Dict[str, tuple] = {}  # hash → (future, difficulty)
+        self._winners: Dict[str, str] = {}    # hash → winning ws_id
         self._timeout = timeout
 
     async def add(self, ws, kshs_address: str) -> str:
@@ -49,7 +50,7 @@ class WorkerPool:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
-        self._pending[hash] = future
+        self._pending[hash] = (future, difficulty)
 
         task_msg = {'action': 'work', 'hash': hash, 'difficulty': difficulty}
         for worker in list(self.workers.values()):
@@ -66,8 +67,11 @@ class WorkerPool:
             return None
         finally:
             self._pending.pop(hash, None)
+            winner_id = self._winners.pop(hash, None)
             cancel_msg = {'action': 'cancel', 'hash': hash}
             for worker in list(self.workers.values()):
+                if worker.ws_id == winner_id:
+                    continue
                 try:
                     await worker.ws.send_json(cancel_msg)
                 except Exception:
@@ -79,19 +83,23 @@ class WorkerPool:
         Validates work via nanolib. Resolves the pending Future if first valid result.
         Returns True if this worker won, False otherwise.
         """
-        future = self._pending.get(hash)
-        if future is None or future.done():
+        entry = self._pending.get(hash)
+        if entry is None:
+            return False
+        future, req_difficulty = entry
+        if future.done():
             return False
 
         try:
             if nanolib is not None:
-                nanolib.validate_work(hash, work)
+                nanolib.validate_work(hash, work, difficulty=req_difficulty)
         except Exception as e:
             logger.warning(f"Invalid work from {ws_id}: {e}")
             return False
 
         try:
             future.set_result(work)
+            self._winners[hash] = ws_id
             return True
         except asyncio.InvalidStateError:
             logger.debug(f"Future already resolved for hash {hash}")

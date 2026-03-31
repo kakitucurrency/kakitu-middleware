@@ -303,6 +303,7 @@ async def handle_worker_ws(request):
 
     ws_id = await worker_pool.add(ws, address)
     stats.connected_workers = worker_pool.count
+    stats.workers_all_time += 1
 
     try:
         async for msg in ws:
@@ -331,23 +332,20 @@ async def pay_and_notify(ws_id: str, hash: str):
     if worker is None:
         return
 
-    # Always record work completion (but not kshs amount — only on actual payout)
-    worker.work_completed += 1
-
     if not WORKER_PAYOUTS_ENABLED:
+        # Track work even in no-payout mode (but no KSHS credited)
+        worker.work_completed += 1
         return
-
-    addr = worker.kshs_address
 
     try:
         tx_hash = await send_reward(
             node_url=NODE_CONNSTR,
             fund_seed=WORKER_FUND_SEED,
             fund_address=WORKER_FUND_ADDRESS,
-            destination=addr,
+            destination=worker.kshs_address,
             amount_kshs=WORK_REWARD_KSHS,
         )
-        # Only record payout after actual success
+        # record_completion increments worker.work_completed internally
         stats.record_completion(worker, WORK_REWARD_KSHS)
         try:
             await worker.ws.send_json({
@@ -360,11 +358,15 @@ async def pay_and_notify(ws_id: str, hash: str):
             pass
     except PayoutError as e:
         log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
+        # Still credit the work even if payout failed
+        worker.work_completed += 1
 
 
 async def handle_stats(request):
     """GET /stats — public network statistics."""
-    return web.json_response(stats.to_dict())
+    data = stats.to_dict()
+    data['work_reward_kshs'] = f'{WORK_REWARD_KSHS:.6f}'
+    return web.json_response(data)
 
 
 async def get_app():

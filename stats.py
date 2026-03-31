@@ -6,6 +6,7 @@ from decimal import Decimal
 class Stats:
     total_work_completed: int = 0
     connected_workers: int = 0
+    workers_all_time: int = 0
     total_kshs_paid: Decimal = field(default_factory=lambda: Decimal('0'))
     _earners: dict = field(default_factory=dict)  # address → {earned, work_completed}
 
@@ -30,6 +31,7 @@ class Stats:
         )[:10]
         return {
             'connected_workers': self.connected_workers,
+            'workers_all_time': self.workers_all_time,
             'total_work_completed': self.total_work_completed,
             'total_kshs_paid': f'{self.total_kshs_paid:.6f}',
             'top_earners': [
