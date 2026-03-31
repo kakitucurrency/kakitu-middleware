@@ -1,24 +1,25 @@
 from dataclasses import dataclass, field
-from typing import List
+from decimal import Decimal
 
 
 @dataclass
 class Stats:
     total_work_completed: int = 0
-    total_kshs_paid: float = 0.0
+    connected_workers: int = 0
+    total_kshs_paid: Decimal = field(default_factory=lambda: Decimal('0'))
     _earners: dict = field(default_factory=dict)  # address → {earned, work_completed}
-    connected_workers: int = 0  # set externally by WorkerPool
 
     def record_completion(self, worker, amount: float):
+        amount_dec = Decimal(str(amount))
         self.total_work_completed += 1
-        self.total_kshs_paid += amount
+        self.total_kshs_paid += amount_dec
         worker.work_completed += 1
         worker.kshs_earned += amount
 
         addr = worker.kshs_address
         if addr not in self._earners:
-            self._earners[addr] = {'earned': 0.0, 'work_completed': 0}
-        self._earners[addr]['earned'] += amount
+            self._earners[addr] = {'earned': Decimal('0'), 'work_completed': 0}
+        self._earners[addr]['earned'] += amount_dec
         self._earners[addr]['work_completed'] += 1
 
     def to_dict(self) -> dict:

@@ -60,3 +60,11 @@ def test_same_address_accumulates():
     earners = s.to_dict()['top_earners']
     assert earners[0]['earned'] == '0.020000'
     assert earners[0]['work_completed'] == 2
+
+
+def test_float_accumulation_precision():
+    s = Stats()
+    for _ in range(100):
+        w = make_worker('kshs_1addr')
+        s.record_completion(w, 0.01)
+    assert s.to_dict()['total_kshs_paid'] == '1.000000'
