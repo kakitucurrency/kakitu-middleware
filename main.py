@@ -370,6 +370,48 @@ async def handle_stats(request):
     return web.json_response(data)
 
 
+async def handle_admin_fund(request):
+    """POST /admin/fund — one-time fund worker wallet from genesis. Requires ADMIN_SECRET env var."""
+    from decimal import Decimal as _Dec
+    ADMIN_SECRET = os.getenv('ADMIN_SECRET', '')
+    if not ADMIN_SECRET:
+        return web.json_response({'error': 'admin not enabled'}, status=403)
+    try:
+        body = await request.json()
+        if body.get('secret') != ADMIN_SECRET:
+            return web.json_response({'error': 'forbidden'}, status=403)
+        priv_hex    = body['priv_hex']     # 64-char hex genesis private key
+        from_addr   = body['from_addr']    # kshs_ address of sender
+        to_addr     = body.get('to_addr', WORKER_FUND_ADDRESS or '')
+        amount_kshs = _Dec(str(body.get('amount_kshs', '10000')))
+        raw_amount  = int(amount_kshs * _Dec(10 ** 30))
+
+        # Get account info from node
+        info = await json_post(f'{NODE_CONNSTR}', {'action': 'account_info', 'account': from_addr, 'representative': 'true'})
+        if not info or 'error' in info:
+            return web.json_response({'error': f'account_info failed: {info}'}, status=500)
+
+        frontier     = info['frontier']
+        current_bal  = int(info['balance'])
+        rep          = info['representative']
+        new_balance  = current_bal - raw_amount
+
+        # Generate work
+        work_info = await json_post(f'{NODE_CONNSTR}', {'action': 'work_generate', 'hash': frontier})
+        if not work_info or 'work' not in work_info:
+            return web.json_response({'error': f'work_generate failed: {work_info}'}, status=500)
+
+        from payout import _build_block
+        block = _build_block(from_addr, frontier, rep, new_balance, to_addr, priv_hex, work_info['work'])
+        result = await json_post(f'{NODE_CONNSTR}', {'action': 'process', 'json_block': 'true', 'subtype': 'send', 'block': block})
+        if result and 'hash' in result:
+            return web.json_response({'ok': True, 'hash': result['hash'], 'amount_kshs': str(amount_kshs)})
+        return web.json_response({'error': str(result)}, status=500)
+    except Exception as e:
+        log.server_logger.exception("admin_fund error")
+        return web.json_response({'error': str(e)}, status=500)
+
+
 async def get_app():
     async def close_redis(app):
         """Close redis connection"""
@@ -418,6 +460,7 @@ async def get_app():
     app.add_routes([web.post('/callback', callback)])
     app.add_routes([web.get('/worker/ws', handle_worker_ws)])
     app.add_routes([web.get('/stats', handle_stats)])
+    app.add_routes([web.post('/admin/fund', handle_admin_fund)])
     app.on_startup.append(open_redis)
     app.on_startup.append(init_queue)
     app.on_startup.append(init_bpow)
