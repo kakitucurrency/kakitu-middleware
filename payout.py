@@ -63,7 +63,11 @@ def _build_block(
         )
         block.sign(private_key_hex)
         block.work = work
-        return json.loads(block.json())
+        block_dict = json.loads(block.json())
+        for k in ('account', 'representative', 'link_as_account'):
+            if k in block_dict and block_dict[k].startswith('nano_'):
+                block_dict[k] = 'kshs_' + block_dict[k][5:]
+        return block_dict
     except ImportError:
         raise PayoutError("nanolib not available — cannot build block on this platform")
 
