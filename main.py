@@ -88,6 +88,7 @@ WORKER_PAYOUTS_ENABLED = (
 
 stats = Stats()
 worker_pool = WorkerPool(timeout=30.0)
+_payout_lock = asyncio.Lock()
 
 work_futures = dict()
 
@@ -331,35 +332,34 @@ async def handle_worker_ws(request):
 async def pay_and_notify(worker, hash: str):
     """Issue payout and notify worker. Fire-and-forget via ensure_future.
     worker is captured at submission time so payout works even if the worker
-    has since disconnected."""
+    has since disconnected. _payout_lock serialises sends so concurrent
+    completions don't race on the same frontier."""
     if not WORKER_PAYOUTS_ENABLED:
-        # Track work even in no-payout mode (but no KSHS credited)
         stats.record_completion(worker, 0)
         return
 
-    try:
-        tx_hash = await send_reward(
-            node_url=NODE_CONNSTR,
-            fund_seed=WORKER_FUND_SEED,
-            fund_address=WORKER_FUND_ADDRESS,
-            destination=worker.kshs_address,
-            amount_kshs=WORK_REWARD_KSHS,
-        )
-        # record_completion increments worker.work_completed internally
-        stats.record_completion(worker, WORK_REWARD_KSHS)
+    async with _payout_lock:
         try:
-            await worker.ws.send_json({
-                'action': 'paid',
-                'hash': hash,
-                'amount': f'{WORK_REWARD_KSHS:.6f}',
-                'tx_hash': tx_hash,
-            })
-        except Exception:
-            pass
-    except Exception as e:
-        log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
-        # Still credit the work even if payout failed
-        stats.record_completion(worker, 0)
+            tx_hash = await send_reward(
+                node_url=NODE_CONNSTR,
+                fund_seed=WORKER_FUND_SEED,
+                fund_address=WORKER_FUND_ADDRESS,
+                destination=worker.kshs_address,
+                amount_kshs=WORK_REWARD_KSHS,
+            )
+            stats.record_completion(worker, WORK_REWARD_KSHS)
+            try:
+                await worker.ws.send_json({
+                    'action': 'paid',
+                    'hash': hash,
+                    'amount': f'{WORK_REWARD_KSHS:.6f}',
+                    'tx_hash': tx_hash,
+                })
+            except Exception:
+                pass
+        except Exception as e:
+            log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
+            stats.record_completion(worker, 0)
 
 
 async def handle_stats(request):
