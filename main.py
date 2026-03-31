@@ -357,7 +357,7 @@ async def pay_and_notify(ws_id: str, hash: str):
             })
         except Exception:
             pass
-    except PayoutError as e:
+    except Exception as e:
         log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
         # Still credit the work even if payout failed
         stats.record_completion(worker, 0)
