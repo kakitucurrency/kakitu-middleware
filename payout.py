@@ -1,9 +1,10 @@
 import hashlib
 import json
 import logging
+from decimal import Decimal
 from typing import Optional
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,8 @@ def _build_block(
 async def _rpc(node_url: str, payload: dict) -> dict:
     """Single RPC call to the Kakitu node."""
     url = node_url if node_url.startswith('http') else f'http://{node_url}'
-    async with ClientSession() as session:
+    timeout = ClientTimeout(total=10)
+    async with ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload) as resp:
             return await resp.json(content_type=None)
 
@@ -84,7 +86,7 @@ async def send_reward(
     Build and submit a Kakitu send block from the worker fund wallet.
     Returns block hash on success. Raises PayoutError on failure.
     """
-    raw_amount = int(amount_kshs * RAW_PER_KSHS)
+    raw_amount = int(Decimal(str(amount_kshs)) * Decimal(RAW_PER_KSHS))
 
     # 1. Get current account state
     info = await _rpc(node_url, {
