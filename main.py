@@ -57,8 +57,8 @@ LOG_FILE = options.log_file
 LISTEN_HOST = str(ipaddress.ip_address(options.host))
 LISTEN_PORT = int(options.port)
 
-# Node URL
-NODE_CONNSTR = options.node_url
+# Node URL — CLI arg takes precedence, fall back to NODE_URL env var
+NODE_CONNSTR = options.node_url or os.getenv('NODE_URL', None)
 NODE_FALLBACK = False
 if NODE_CONNSTR is not None:
     try:
@@ -193,7 +193,7 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
                     log.server_logger.info(f'task returned error {result["error"]}')
             except Exception as exc:
                 log.server_logger.exception("Task raised an exception")
-                result.cancel()
+                task.cancel()
     # Fallback method
     if NODE_FALLBACK:
         return await json_post(f"http://{NODE_CONNSTR}", request, timeout=30)
