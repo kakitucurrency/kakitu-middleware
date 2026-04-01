@@ -330,38 +330,18 @@ async def handle_worker_ws(request):
 
 
 async def _fast_work_generate(hash: str) -> str:
-    """Generate payout work via BoomPow / work peers / node.
+    """Generate payout work directly via node RPC.
     Bypasses worker pool so we don't cancel in-progress miner tasks.
     Uses send/change difficulty (64x)."""
-    difficulty = 'fffffff800000000'
-    request = {"action": "work_generate", "hash": hash, "difficulty": difficulty}
-
-    # Try work peers + BoomPow (skip worker pool)
-    tasks = []
-    for p in WORK_URLS:
-        tasks.append(asyncio.create_task(json_post(p, request, app=work_app)))
-    if BPOW_ENABLED:
-        tasks.append(asyncio.create_task(work_app['bpow'].request_work(hash, difficulty)))
-
-    while len(tasks):
-        done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=30)
-        for task in done:
-            try:
-                result = task.result()
-                if isinstance(result, list):
-                    result = json.loads(result[1])
-                if result and 'work' in result:
-                    return result['work']
-            except Exception:
-                pass
-
-    # Final fallback: direct node RPC
-    if NODE_FALLBACK:
-        result = await json_post(f"http://{NODE_CONNSTR}", request, timeout=30)
-        if result and 'work' in result:
-            return result['work']
-
-    raise Exception("all payout work providers failed")
+    from payout import _rpc, SEND_DIFFICULTY
+    work_resp = await _rpc(NODE_CONNSTR, {
+        'action': 'work_generate',
+        'hash': hash,
+        'difficulty': SEND_DIFFICULTY,
+    }, timeout_secs=30)
+    if 'work' in work_resp:
+        return work_resp['work']
+    raise Exception(f"payout work_generate failed: {work_resp}")
 
 
 async def pay_and_notify(worker, hash: str):
