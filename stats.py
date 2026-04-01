@@ -10,7 +10,7 @@ class Stats:
     total_kshs_paid: Decimal = field(default_factory=lambda: Decimal('0'))
     _earners: dict = field(default_factory=dict)  # address → {earned, work_completed}
 
-    def record_completion(self, worker, amount: float):
+    def record_completion(self, worker, amount):
         """Record a completed payout. Only counts towards totals when amount > 0."""
         amount_dec = Decimal(str(amount))
         if amount_dec <= 0:
@@ -19,7 +19,7 @@ class Stats:
         self.total_work_completed += 1
         self.total_kshs_paid += amount_dec
         worker.work_completed += 1
-        worker.kshs_earned += amount
+        worker.kshs_earned += amount_dec
 
         addr = worker.kshs_address
         if addr not in self._earners:

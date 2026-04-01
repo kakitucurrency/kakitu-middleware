@@ -3,6 +3,7 @@ import uuid
 import logging
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Dict, Optional
 
 try:
@@ -20,7 +21,7 @@ class Worker:
     kshs_address: str
     connected_at: float = field(default_factory=time.time)
     work_completed: int = 0
-    kshs_earned: float = 0.0
+    kshs_earned: Decimal = field(default_factory=lambda: Decimal('0'))
 
 
 class WorkerPool:

@@ -7,20 +7,38 @@ import asyncio
 import ipaddress
 import logging
 import json
+import signal
+import uuid
 import aioredis
 import datetime
-from aiohttp import ClientSession, WSMsgType, log, web
+from aiohttp import ClientSession, ClientTimeout, WSMsgType, log, web
 from logging.handlers import TimedRotatingFileHandler, WatchedFileHandler
 import uvloop
 import sys
 import os
 import nanolib
+from decimal import Decimal
+
+import re
 
 from bpow_client import BPOWClient, ConnectionClosed
+
+# Valid base32 alphabet for Kakitu/Nano addresses (no 0, 2, l, v)
+_KSHS_ADDR_RE = re.compile(r'^kshs_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$')
+
+
+def validate_kshs_address(address: str) -> bool:
+    """Validate a kshs_ address: correct prefix, length (65), and base32 chars."""
+    if not isinstance(address, str):
+        return False
+    if len(address) != 65:
+        return False
+    return _KSHS_ADDR_RE.match(address) is not None
+
 from aiographql.client import GraphQLResponse
 from stats import Stats
 from worker_hub import WorkerPool
-from payout import send_reward, PayoutError
+from payout import send_reward, PayoutError, SEND_DIFFICULTY
 
 uvloop.install()
 
@@ -66,7 +84,7 @@ if NODE_CONNSTR is not None:
         NODE_PORT = NODE_CONNSTR.split(':')[1]
         NODE_FALLBACK = True
     except Exception:
-        print(f"Invalid node connection string, should be url:port, not {NODE_CONNSTR}")
+        logging.error(f"Invalid node connection string, should be url:port, not {NODE_CONNSTR}")
         parser.print_help()
         sys.exit(1)
 
@@ -79,7 +97,7 @@ BPOW_FOR_KAKITU = options.bpow_kakitu_difficulty
 # Worker hub configuration
 WORKER_FUND_SEED = os.getenv('WORKER_FUND_SEED', None)
 WORKER_FUND_ADDRESS = os.getenv('WORKER_FUND_ADDRESS', None)
-WORK_REWARD_KSHS = float(os.getenv('WORK_REWARD_KSHS', '0.01'))
+WORK_REWARD_KSHS = Decimal(os.getenv('WORK_REWARD_KSHS', '0.01'))
 WORKER_PAYOUTS_ENABLED = (
     WORKER_FUND_SEED is not None
     and WORKER_FUND_ADDRESS is not None
@@ -89,6 +107,7 @@ WORKER_PAYOUTS_ENABLED = (
 stats = Stats()
 worker_pool = WorkerPool(timeout=30.0)
 _payout_lock = asyncio.Lock()
+_idempotency_cache: dict = {}  # idempotency_key → response dict
 
 work_futures = dict()
 
@@ -105,10 +124,11 @@ PRECACHE_Q_KEY = 'kakitu_middleware_pcache_q'
 
 ### PEER-related functions
 
-async def json_post(url, request, timeout=10, app=None, dontcare=False):
+async def json_post(url, request, timeout=30, app=None, dontcare=False):
     try:
-        async with ClientSession() as session:
-            async with session.post(url, json=request, timeout=timeout) as resp:
+        ct = ClientTimeout(total=timeout)
+        async with ClientSession(timeout=ct) as session:
+            async with session.post(url, json=request) as resp:
                 if dontcare:
                     return resp.status
                 else:
@@ -134,17 +154,18 @@ async def work_cancel(hash):
 async def work_generate(hash, app, precache=False, difficulty=None, reward=True):
     """RPC work_generate"""
     redis = app['redis']
-    request = {"action":"work_generate", "hash":hash}
+    # Always include difficulty; fall back to SEND_DIFFICULTY when not specified
+    if difficulty is None:
+        difficulty = SEND_DIFFICULTY
+    request = {"action":"work_generate", "hash":hash, "difficulty": difficulty}
     request['reward'] = reward
-    if difficulty is not None:
-        request['difficulty'] = difficulty
     # Try connected workers first
     if not precache and worker_pool.count > 0:
-        worker_result = await worker_pool.dispatch(hash, difficulty or 'ffffffc000000000')
+        worker_result = await worker_pool.dispatch(hash, difficulty)
         if worker_result is not None:
             try:
                 await redis.set(
-                    f"{hash}:{difficulty}" if difficulty is not None else hash,
+                    f"{hash}:{difficulty}",
                     worker_result,
                     expire=600000
                 )
@@ -186,7 +207,7 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
                 if 'work' in result:
                     asyncio.ensure_future(work_cancel(hash))
                     try:
-                        await redis.set(f"{hash}:{difficulty}" if difficulty is not None else hash, result['work'], expire=600000) # Cache work
+                        await redis.set(f"{hash}:{difficulty}", result['work'], expire=600000) # Cache work
                     except Exception:
                         pass
                     return result
@@ -195,9 +216,9 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
             except Exception as exc:
                 log.server_logger.exception("Task raised an exception")
                 task.cancel()
-    # Fallback method
+    # Fallback method — work_generate can be slow, allow 120s
     if NODE_FALLBACK:
-        return await json_post(f"http://{NODE_CONNSTR}", request, timeout=30)
+        return await json_post(f"http://{NODE_CONNSTR}", request, timeout=120)
 
     return None
 
@@ -224,6 +245,9 @@ async def precache_queue_process(app):
 
 ### API
 
+_HEX64_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+
+
 async def rpc(request):
     requestjson = await request.json()
     log.server_logger.info(f"Received request {str(requestjson)}")
@@ -232,16 +256,21 @@ async def rpc(request):
     elif 'hash' not in requestjson:
         return web.HTTPBadRequest(reason='Missing hash in request')
 
-    difficulty = requestjson['difficulty'] if 'difficulty' in requestjson else None
-    reward = requestjson['reward'] if 'reward' in requestjson else True
+    # Sanitize hash: must be exactly 64 hex characters
+    req_hash = str(requestjson['hash']).strip()
+    if not _HEX64_RE.match(req_hash):
+        return web.HTTPBadRequest(reason='Invalid hash format')
+    requestjson['hash'] = req_hash
+
+    difficulty = requestjson.get('difficulty', SEND_DIFFICULTY)
+    reward = requestjson.get('reward', True)
     # See if work is in cache
     try:
-        work = await request.app['redis'].get(f"{requestjson['hash']}:{difficulty}" if difficulty is not None else requestjson['hash'])
+        work = await request.app['redis'].get(f"{requestjson['hash']}:{difficulty}")
         if work is not None:
             # Validate
-            test_difficulty = difficulty if difficulty is not None else BPOWClient.KSHS_DIFFICULTY_CONST if BPOW_FOR_KAKITU else 'fffffe0000000000'
             try:
-                nanolib.validate_work(requestjson['hash'], work, difficulty=test_difficulty)
+                nanolib.validate_work(requestjson['hash'], work, difficulty=difficulty)
                 return web.json_response({"work":work})
             except nanolib.InvalidWork:
                 pass
@@ -299,7 +328,7 @@ async def handle_worker_ws(request):
         return ws
 
     address = msg.get('kshs_address', '')
-    if not address.startswith('kshs_'):
+    if not validate_kshs_address(address):
         await ws.close(code=4001, message=b'invalid kshs_ address')
         return ws
 
@@ -352,8 +381,20 @@ async def pay_and_notify(worker, hash: str):
     if not WORKER_PAYOUTS_ENABLED:
         return
 
+    # Natural idempotency key: worker_address:block_hash
+    payout_key = f"{worker.kshs_address}:{hash}"
+    if payout_key in _idempotency_cache:
+        return
+
+    req_id = str(uuid.uuid4())[:8]
     async with _payout_lock:
+        # Re-check after acquiring lock (another coroutine may have completed it)
+        if payout_key in _idempotency_cache:
+            return
         try:
+            log.server_logger.info(
+                f"[payout:{req_id}] sending {WORK_REWARD_KSHS} KSHS to {worker.kshs_address} for hash {hash}"
+            )
             tx_hash = await send_reward(
                 node_url=NODE_CONNSTR,
                 fund_seed=WORKER_FUND_SEED,
@@ -362,43 +403,87 @@ async def pay_and_notify(worker, hash: str):
                 amount_kshs=WORK_REWARD_KSHS,
                 work_generate_fn=_fast_work_generate,
             )
+            _idempotency_cache[payout_key] = tx_hash
             stats.record_completion(worker, WORK_REWARD_KSHS)
+            log.server_logger.info(
+                f"[payout:{req_id}] paid {worker.kshs_address} — block {tx_hash}"
+            )
             try:
                 await worker.ws.send_json({
                     'action': 'paid',
                     'hash': hash,
-                    'amount': f'{WORK_REWARD_KSHS:.6f}',
+                    'amount': str(WORK_REWARD_KSHS),
                     'tx_hash': tx_hash,
                 })
             except Exception:
                 pass
         except Exception as e:
-            log.server_logger.error(f"Payout failed for {worker.kshs_address}: {e}")
+            log.server_logger.error(f"[payout:{req_id}] failed for {worker.kshs_address}: {e}")
             stats.record_completion(worker, 0)
 
 
 async def handle_stats(request):
     """GET /stats — public network statistics."""
     data = stats.to_dict()
-    data['work_reward_kshs'] = f'{WORK_REWARD_KSHS:.6f}'
+    data['work_reward_kshs'] = str(WORK_REWARD_KSHS)
     return web.json_response(data, headers={'Access-Control-Allow-Origin': '*'})
+
+
+async def handle_health(request):
+    """GET /health -- liveness/readiness check."""
+    node_connected = False
+    if NODE_CONNSTR:
+        try:
+            from payout import _rpc
+            resp = await _rpc(NODE_CONNSTR, {'action': 'version'}, timeout_secs=5)
+            node_connected = 'node_vendor' in resp or 'rpc_version' in resp
+        except Exception:
+            node_connected = False
+    return web.json_response({
+        'status': 'ok',
+        'node_connected': node_connected,
+        'workers': worker_pool.count,
+    })
+
+
+MAX_TRANSACTION_KSHS = Decimal('1000000')  # 1M KSHS per tx safety cap
 
 
 async def handle_admin_fund(request):
     """POST /admin/fund — one-time fund worker wallet from genesis. Requires ADMIN_SECRET env var."""
-    from decimal import Decimal as _Dec
     ADMIN_SECRET = os.getenv('ADMIN_SECRET', '')
     if not ADMIN_SECRET:
         return web.json_response({'error': 'admin not enabled'}, status=403)
     try:
         body = await request.json()
-        if body.get('secret') != ADMIN_SECRET:
+        secret = body.get('secret', '')
+        if not secret or not secret.strip():
+            return web.json_response({'error': 'missing admin secret'}, status=403)
+        if secret != ADMIN_SECRET:
             return web.json_response({'error': 'forbidden'}, status=403)
         priv_hex    = body['priv_hex']     # 64-char hex genesis private key
-        from_addr   = body['from_addr']    # kshs_ address of sender
-        to_addr     = body.get('to_addr', WORKER_FUND_ADDRESS or '')
-        amount_kshs = _Dec(str(body.get('amount_kshs', '10000')))
-        raw_amount  = int(amount_kshs * _Dec(10 ** 30))
+        from_addr   = str(body.get('from_addr', '')).strip()
+        to_addr     = str(body.get('to_addr', WORKER_FUND_ADDRESS or '')).strip()
+        if not validate_kshs_address(from_addr):
+            return web.json_response({'error': 'invalid from_addr'}, status=400)
+        if not validate_kshs_address(to_addr):
+            return web.json_response({'error': 'invalid to_addr'}, status=400)
+        amount_kshs = Decimal(str(body.get('amount_kshs', '10000')))
+        if amount_kshs <= 0:
+            return web.json_response({'error': 'amount must be positive'}, status=400)
+        if amount_kshs > MAX_TRANSACTION_KSHS:
+            return web.json_response(
+                {'error': f'amount exceeds max {MAX_TRANSACTION_KSHS} KSHS per transaction'},
+                status=400,
+            )
+
+        # Idempotency: if key already processed, return cached result
+        idempotency_key = body.get('idempotency_key')
+        if idempotency_key and idempotency_key in _idempotency_cache:
+            return web.json_response(_idempotency_cache[idempotency_key])
+
+        req_id = str(uuid.uuid4())[:8]
+        log.server_logger.info(f"[req:{req_id}] admin_fund: {from_addr} -> {to_addr}, {amount_kshs} KSHS")
 
         # Use send_reward which handles work_generate with correct 120s timeout
         tx_hash = await send_reward(
@@ -406,11 +491,15 @@ async def handle_admin_fund(request):
             fund_seed=priv_hex,
             fund_address=from_addr,
             destination=to_addr,
-            amount_kshs=float(amount_kshs),
+            amount_kshs=amount_kshs,
         )
-        return web.json_response({'ok': True, 'hash': tx_hash, 'amount_kshs': str(amount_kshs)})
+        result = {'ok': True, 'hash': tx_hash, 'amount_kshs': str(amount_kshs)}
+        if idempotency_key:
+            _idempotency_cache[idempotency_key] = result
+        log.server_logger.info(f"[req:{req_id}] admin_fund complete: block {tx_hash}")
+        return web.json_response(result)
     except Exception as e:
-        log.server_logger.exception("admin_fund error")
+        log.server_logger.error(f"admin_fund error: {e}")
         return web.json_response({'error': str(e)}, status=500)
 
 
@@ -431,7 +520,7 @@ async def get_app():
                                                 db=int(os.getenv('REDIS_DB', '1')), encoding='utf-8', minsize=2, maxsize=15)
         except Exception:
             app['redis'] = None
-            log.server_logger.warn('WARNING: Could not connect to Redis, work caching and some other features will not work')
+            log.server_logger.warning('Could not connect to Redis, work caching and some other features will not work')
 
     async def init_queue(app):
         """Initialize task queue"""
@@ -441,19 +530,24 @@ async def get_app():
         app['precache_task'].cancel()
         await app['precache_task']
 
+    log_formatter = logging.Formatter(
+        "%(asctime)s;%(levelname)s;%(message)s", "%Y-%m-%d %H:%M:%S %z"
+    )
     if DEBUG:
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s;%(levelname)s;%(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S %z")
     else:
         if LOG_FILE is not None:
             root = logging.getLogger('aiohttp.server')
-            logging.basicConfig(level=logging.INFO)
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s;%(levelname)s;%(message)s",
+                                datefmt="%Y-%m-%d %H:%M:%S %z")
             handler = WatchedFileHandler(LOG_FILE)
-            formatter = logging.Formatter("%(asctime)s;%(levelname)s;%(message)s", "%Y-%m-%d %H:%M:%S %z")
-            handler.setFormatter(formatter)
+            handler.setFormatter(log_formatter)
             root.addHandler(handler)
             root.addHandler(TimedRotatingFileHandler(LOG_FILE, when="d", interval=1, backupCount=100))
         else:
-            logging.basicConfig(level=logging.INFO)
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s;%(levelname)s;%(message)s",
+                                datefmt="%Y-%m-%d %H:%M:%S %z")
     app = web.Application()
     app['busy'] = False
     app['failover'] = False
@@ -463,6 +557,7 @@ async def get_app():
     app.add_routes([web.get('/worker/ws', handle_worker_ws)])
     app.add_routes([web.get('/stats', handle_stats)])
     app.add_routes([web.post('/admin/fund', handle_admin_fund)])
+    app.add_routes([web.get('/health', handle_health)])
     app.on_startup.append(open_redis)
     app.on_startup.append(init_queue)
     app.on_startup.append(init_bpow)
@@ -474,17 +569,48 @@ async def get_app():
 work_app = current_loop.run_until_complete(get_app())
 
 def main():
-    """Main application loop"""
+    """Main application loop with graceful shutdown."""
 
-    # Start web/ws server
+    runner = None
+
     async def start():
+        nonlocal runner
         runner = web.AppRunner(work_app)
         await runner.setup()
         site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
         await site.start()
+        log.server_logger.info(f"Kakitu middleware listening on {LISTEN_HOST}:{LISTEN_PORT}")
 
-    async def end():
+    async def graceful_shutdown():
+        """Stop accepting connections, wait for in-flight payouts, then cleanup."""
+        log.server_logger.info("Shutdown signal received, stopping gracefully...")
+
+        # 1. Stop accepting new connections
+        if runner is not None:
+            await runner.cleanup()
+
+        # 2. Wait for in-flight payouts to complete (up to 30s)
+        if _payout_lock.locked():
+            log.server_logger.info("Waiting for in-flight payouts to complete (up to 30s)...")
+            try:
+                await asyncio.wait_for(_payout_lock.acquire(), timeout=30)
+                _payout_lock.release()
+            except asyncio.TimeoutError:
+                log.server_logger.warning("Timed out waiting for in-flight payouts")
+
+        # 3. Clean shutdown of the app
         await work_app.shutdown()
+        await work_app.cleanup()
+        log.server_logger.info("Shutdown complete.")
+
+    def _signal_handler():
+        log.server_logger.info("Received termination signal")
+        asyncio.ensure_future(graceful_shutdown())
+        current_loop.call_later(1, current_loop.stop)
+
+    # Register signal handlers for graceful shutdown
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        current_loop.add_signal_handler(sig, _signal_handler)
 
     current_loop.run_until_complete(start())
 
@@ -494,7 +620,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        current_loop.run_until_complete(end())
+        current_loop.run_until_complete(graceful_shutdown())
 
     current_loop.close()
 

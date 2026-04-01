@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 from decimal import Decimal
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, Union
 
 from aiohttp import ClientSession, ClientTimeout
 
@@ -89,7 +89,7 @@ async def send_reward(
     fund_seed: str,
     fund_address: str,
     destination: str,
-    amount_kshs: float,
+    amount_kshs: Union[Decimal, str, float],
     work_generate_fn: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> str:
     """
@@ -99,12 +99,13 @@ async def send_reward(
     work_generate_fn: optional async callable (hash) -> work_hex.
     When provided, work is generated through the middleware's worker pool
     (fast) instead of direct node RPC (slow, 120s).
-    Retries once on Fork error (stale frontier).
+    Retries up to 3 times on Fork error (stale frontier) with exponential backoff.
     """
+    MAX_RETRIES = 3
     raw_amount = int(Decimal(str(amount_kshs)) * Decimal(RAW_PER_KSHS))
     private_key_hex = derive_private_key(fund_seed, 0)
 
-    for attempt in range(2):
+    for attempt in range(MAX_RETRIES):
         # 1. Get current account state
         info = await _rpc(node_url, {
             'action': 'account_info',
@@ -164,13 +165,17 @@ async def send_reward(
             logger.info(f"Paid {amount_kshs} KSHS to {destination} — block {process_resp['hash']}")
             return process_resp['hash']
 
-        # Retry once on Fork (stale frontier)
+        # Retry on Fork (stale frontier) with exponential backoff
         err_str = str(process_resp.get('error', ''))
-        if 'Fork' in err_str and attempt == 0:
-            logger.warning(f"Fork on payout attempt, retrying: {process_resp}")
-            await asyncio.sleep(0.5)
+        if 'Fork' in err_str and attempt < MAX_RETRIES - 1:
+            backoff = 2 ** attempt  # 1s, 2s, 4s
+            logger.warning(
+                f"Fork on payout attempt {attempt + 1}/{MAX_RETRIES}, "
+                f"retrying in {backoff}s: {process_resp}"
+            )
+            await asyncio.sleep(backoff)
             continue
 
         raise PayoutError(f"process failed: {process_resp}")
 
-    raise PayoutError("payout failed after retries")
+    raise PayoutError(f"payout failed after {MAX_RETRIES} retries (Fork)")
