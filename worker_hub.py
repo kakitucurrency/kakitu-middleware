@@ -98,8 +98,8 @@ class WorkerPool:
             return False
 
         try:
+            self._winners[hash] = ws_id  # set before resolving to avoid race in dispatch's finally
             future.set_result(work)
-            self._winners[hash] = ws_id
             return True
         except asyncio.InvalidStateError:
             logger.debug(f"Future already resolved for hash {hash}")

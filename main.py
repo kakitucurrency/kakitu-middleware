@@ -329,13 +329,21 @@ async def handle_worker_ws(request):
     return ws
 
 
+async def _fast_work_generate(hash: str) -> str:
+    """Generate work through the middleware's worker pool / BoomPow / peers.
+    Falls back to direct node RPC. Uses send/change difficulty (64x)."""
+    result = await work_generate(hash, work_app, difficulty='fffffff800000000')
+    if result and 'work' in result:
+        return result['work']
+    raise Exception("all work providers failed")
+
+
 async def pay_and_notify(worker, hash: str):
     """Issue payout and notify worker. Fire-and-forget via ensure_future.
     worker is captured at submission time so payout works even if the worker
     has since disconnected. _payout_lock serialises sends so concurrent
     completions don't race on the same frontier."""
     if not WORKER_PAYOUTS_ENABLED:
-        stats.record_completion(worker, 0)
         return
 
     async with _payout_lock:
@@ -346,6 +354,7 @@ async def pay_and_notify(worker, hash: str):
                 fund_address=WORKER_FUND_ADDRESS,
                 destination=worker.kshs_address,
                 amount_kshs=WORK_REWARD_KSHS,
+                work_generate_fn=_fast_work_generate,
             )
             stats.record_completion(worker, WORK_REWARD_KSHS)
             try:

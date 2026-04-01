@@ -11,7 +11,11 @@ class Stats:
     _earners: dict = field(default_factory=dict)  # address → {earned, work_completed}
 
     def record_completion(self, worker, amount: float):
+        """Record a completed payout. Only counts towards totals when amount > 0."""
         amount_dec = Decimal(str(amount))
+        if amount_dec <= 0:
+            return
+
         self.total_work_completed += 1
         self.total_kshs_paid += amount_dec
         worker.work_completed += 1

@@ -1,14 +1,18 @@
+import asyncio
 import hashlib
 import json
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Awaitable, Optional
 
 from aiohttp import ClientSession, ClientTimeout
 
 logger = logging.getLogger(__name__)
 
 RAW_PER_KSHS = 10 ** 30
+
+# Kakitu send/change difficulty (64x Nano base)
+SEND_DIFFICULTY = 'fffffff800000000'
 
 
 class PayoutError(Exception):
@@ -51,7 +55,6 @@ def _build_block(
     """
     try:
         import nanolib
-        # nanolib.Block.link expects a 64-char hex public key, not an account address
         dest_pubkey_hex = nanolib.get_account_public_key(account_id=_kshs_to_nano(destination))
         block = nanolib.Block(
             block_type='state',
@@ -87,65 +90,87 @@ async def send_reward(
     fund_address: str,
     destination: str,
     amount_kshs: float,
+    work_generate_fn: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> str:
     """
     Build and submit a Kakitu send block from the worker fund wallet.
     Returns block hash on success. Raises PayoutError on failure.
+
+    work_generate_fn: optional async callable (hash) -> work_hex.
+    When provided, work is generated through the middleware's worker pool
+    (fast) instead of direct node RPC (slow, 120s).
+    Retries once on Fork error (stale frontier).
     """
     raw_amount = int(Decimal(str(amount_kshs)) * Decimal(RAW_PER_KSHS))
-
-    # 1. Get current account state
-    info = await _rpc(node_url, {
-        'action': 'account_info',
-        'account': fund_address,
-        'representative': 'true',
-    })
-    if 'error' in info:
-        raise PayoutError(f"account_info failed: {info['error']}")
-
-    frontier = info['frontier']
-    current_balance = int(info['balance'])
-    representative = info['representative']
-
-    if current_balance < raw_amount:
-        raise PayoutError(
-            f"Insufficient funds: {current_balance} raw < {raw_amount} raw needed"
-        )
-
-    new_balance = current_balance - raw_amount
-
-    # 2. Derive private key
     private_key_hex = derive_private_key(fund_seed, 0)
 
-    # 3. Generate work for the frontier
-    work_resp = await _rpc(node_url, {
-        'action': 'work_generate',
-        'hash': frontier,
-    }, timeout_secs=120)
-    if 'work' not in work_resp:
-        raise PayoutError(f"work_generate failed: {work_resp}")
+    for attempt in range(2):
+        # 1. Get current account state
+        info = await _rpc(node_url, {
+            'action': 'account_info',
+            'account': fund_address,
+            'representative': 'true',
+        })
+        if 'error' in info:
+            raise PayoutError(f"account_info failed: {info['error']}")
 
-    # 4. Build and sign block
-    block_dict = _build_block(
-        fund_address=fund_address,
-        frontier=frontier,
-        representative=representative,
-        new_balance=new_balance,
-        destination=destination,
-        private_key_hex=private_key_hex,
-        work=work_resp['work'],
-    )
+        frontier = info['frontier']
+        current_balance = int(info['balance'])
+        representative = info['representative']
 
-    # 5. Submit block
-    process_resp = await _rpc(node_url, {
-        'action': 'process',
-        'json_block': 'true',
-        'subtype': 'send',
-        'block': block_dict,
-    })
+        if current_balance < raw_amount:
+            raise PayoutError(
+                f"Insufficient funds: {current_balance} raw < {raw_amount} raw needed"
+            )
 
-    if 'hash' not in process_resp:
+        new_balance = current_balance - raw_amount
+
+        # 2. Generate work for the frontier
+        if work_generate_fn is not None:
+            try:
+                work = await work_generate_fn(frontier)
+            except Exception as e:
+                raise PayoutError(f"work_generate_fn failed: {e}")
+        else:
+            work_resp = await _rpc(node_url, {
+                'action': 'work_generate',
+                'hash': frontier,
+                'difficulty': SEND_DIFFICULTY,
+            }, timeout_secs=120)
+            if 'work' not in work_resp:
+                raise PayoutError(f"work_generate failed: {work_resp}")
+            work = work_resp['work']
+
+        # 3. Build and sign block
+        block_dict = _build_block(
+            fund_address=fund_address,
+            frontier=frontier,
+            representative=representative,
+            new_balance=new_balance,
+            destination=destination,
+            private_key_hex=private_key_hex,
+            work=work,
+        )
+
+        # 4. Submit block
+        process_resp = await _rpc(node_url, {
+            'action': 'process',
+            'json_block': 'true',
+            'subtype': 'send',
+            'block': block_dict,
+        })
+
+        if 'hash' in process_resp:
+            logger.info(f"Paid {amount_kshs} KSHS to {destination} — block {process_resp['hash']}")
+            return process_resp['hash']
+
+        # Retry once on Fork (stale frontier)
+        err_str = str(process_resp.get('error', ''))
+        if 'Fork' in err_str and attempt == 0:
+            logger.warning(f"Fork on payout attempt, retrying: {process_resp}")
+            await asyncio.sleep(0.5)
+            continue
+
         raise PayoutError(f"process failed: {process_resp}")
 
-    logger.info(f"Paid {amount_kshs} KSHS to {destination} — block {process_resp['hash']}")
-    return process_resp['hash']
+    raise PayoutError("payout failed after retries")
