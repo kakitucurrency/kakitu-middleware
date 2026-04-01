@@ -25,7 +25,7 @@ async def test_add_and_remove_worker():
 @pytest.mark.asyncio
 async def test_dispatch_returns_none_when_empty():
     pool = WorkerPool()
-    result = await pool.dispatch('HASH123', 'ffffffc000000000')
+    result = await pool.dispatch('HASH123', 'fffff00000000000')
     assert result is None
 
 
@@ -43,13 +43,13 @@ async def test_dispatch_sends_task_to_workers():
     mock_nanolib.validate_work.return_value = None
     with patch('worker_hub.nanolib', mock_nanolib):
         asyncio.create_task(fake_submit())
-        result = await pool.dispatch('HASH123', 'ffffffc000000000')
+        result = await pool.dispatch('HASH123', 'fffff00000000000')
 
     assert result == 'aabbccdd11223344'
     ws.send_json.assert_any_call({
         'action': 'work',
         'hash': 'HASH123',
-        'difficulty': 'ffffffc000000000',
+        'difficulty': 'fffff00000000000',
     })
 
 
@@ -58,7 +58,7 @@ async def test_dispatch_times_out_when_no_result():
     pool = WorkerPool(timeout=0.05)
     ws = make_ws()
     await pool.add(ws, 'kshs_1abc')
-    result = await pool.dispatch('DEADBEEF', 'ffffffc000000000')
+    result = await pool.dispatch('DEADBEEF', 'fffff00000000000')
     assert result is None
 
 

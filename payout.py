@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 RAW_PER_KSHS = 10 ** 30
 
-# Kakitu send/change difficulty (64x Nano base)
-SEND_DIFFICULTY = 'fffffff800000000'
+# Kakitu send/change difficulty (private network, ~64x lower than Nano mainnet)
+SEND_DIFFICULTY = 'fffff00000000000'
 
 
 class PayoutError(Exception):
