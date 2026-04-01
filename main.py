@@ -4,10 +4,12 @@ load_dotenv()
 
 import argparse
 import asyncio
+import collections
 import ipaddress
 import logging
 import json
 import signal
+import time
 import uuid
 import aioredis
 import datetime
@@ -104,12 +106,89 @@ WORKER_PAYOUTS_ENABLED = (
     and NODE_CONNSTR is not None
 )
 
+# Fix 7: Validate critical env vars at startup
+_HEX64_SEED_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+if WORKER_PAYOUTS_ENABLED:
+    if not _HEX64_SEED_RE.match(WORKER_FUND_SEED):
+        logging.error("WORKER_FUND_SEED must be a 64-character hex string")
+        sys.exit(1)
+    if not validate_kshs_address(WORKER_FUND_ADDRESS):
+        logging.error("WORKER_FUND_ADDRESS must be a valid kshs_ address (65 chars)")
+        sys.exit(1)
+    if WORK_REWARD_KSHS <= 0 or WORK_REWARD_KSHS > 100:
+        logging.error("WORK_REWARD_KSHS must be positive and <= 100")
+        sys.exit(1)
+
 stats = Stats()
 worker_pool = WorkerPool(timeout=30.0)
 _payout_lock = asyncio.Lock()
-_idempotency_cache: dict = {}  # idempotency_key → response dict
+
+# Fix 2: TTL-based idempotency cache to prevent unbounded growth
+IDEMPOTENCY_TTL = 3600  # 1 hour
+_IDEMPOTENCY_MAX_SIZE = 10000
+_idempotency_cache: collections.OrderedDict = collections.OrderedDict()  # key → (result, timestamp)
+
+
+def _idempotency_get(key: str):
+    """Return cached result if present and not expired, else None."""
+    entry = _idempotency_cache.get(key)
+    if entry is None:
+        return None
+    result, ts = entry
+    if time.time() - ts > IDEMPOTENCY_TTL:
+        _idempotency_cache.pop(key, None)
+        return None
+    return result
+
+
+def _idempotency_set(key: str, result):
+    """Store result with timestamp. Evict oldest if over max size."""
+    _idempotency_cache[key] = (result, time.time())
+    _idempotency_cache.move_to_end(key)
+    while len(_idempotency_cache) > _IDEMPOTENCY_MAX_SIZE:
+        _idempotency_cache.popitem(last=False)
+
+
+def _idempotency_cleanup():
+    """Remove all expired entries."""
+    now = time.time()
+    expired = [k for k, (_, ts) in _idempotency_cache.items() if now - ts > IDEMPOTENCY_TTL]
+    for k in expired:
+        _idempotency_cache.pop(k, None)
+
+# Fix 3: Retry queue for failed payouts
+_PAYOUT_MAX_RETRIES = 3
+_payout_retry_queue: collections.deque = collections.deque()  # (worker, hash, attempt_count)
 
 work_futures = dict()
+
+
+# Fix 6: Safe Redis helpers that handle None / disconnected redis
+async def redis_safe_get(app, key):
+    """Return cached value or None if redis is unavailable."""
+    redis = app.get('redis')
+    if redis is None:
+        return None
+    try:
+        return await redis.get(key)
+    except Exception:
+        return None
+
+
+async def redis_safe_set(app, key, value, expire=None):
+    """Set a key, silently returning False if redis is unavailable."""
+    redis = app.get('redis')
+    if redis is None:
+        return False
+    try:
+        if expire is not None:
+            await redis.set(key, value, expire=expire)
+        else:
+            await redis.set(key, value)
+        return True
+    except Exception:
+        return False
+
 
 async def init_bpow(app):
     if BPOW_ENABLED:
@@ -153,7 +232,6 @@ async def work_cancel(hash):
 
 async def work_generate(hash, app, precache=False, difficulty=None, reward=True):
     """RPC work_generate"""
-    redis = app['redis']
     # Always include difficulty; fall back to SEND_DIFFICULTY when not specified
     if difficulty is None:
         difficulty = SEND_DIFFICULTY
@@ -163,14 +241,7 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
     if not precache and worker_pool.count > 0:
         worker_result = await worker_pool.dispatch(hash, difficulty)
         if worker_result is not None:
-            try:
-                await redis.set(
-                    f"{hash}:{difficulty}",
-                    worker_result,
-                    expire=600000
-                )
-            except Exception:
-                pass
+            await redis_safe_set(app, f"{hash}:{difficulty}", worker_result, expire=600000)
             return {'work': worker_result}
 
     # Fallback: work peers + BoomPow
@@ -206,10 +277,7 @@ async def work_generate(hash, app, precache=False, difficulty=None, reward=True)
                     continue
                 if 'work' in result:
                     asyncio.ensure_future(work_cancel(hash))
-                    try:
-                        await redis.set(f"{hash}:{difficulty}", result['work'], expire=600000) # Cache work
-                    except Exception:
-                        pass
+                    await redis_safe_set(app, f"{hash}:{difficulty}", result['work'], expire=600000)
                     return result
                 elif 'error' in result:
                     log.server_logger.info(f'task returned error {result["error"]}')
@@ -229,13 +297,21 @@ async def precache_queue_process(app):
             await asyncio.sleep(5)
             continue
 
-        # Pop item off the queue
-        hash = await app['redis'].lpop(PRECACHE_Q_KEY)
+        # Pop item off the queue (lpop needs direct redis access)
+        redis = app.get('redis')
+        if redis is None:
+            await asyncio.sleep(3)
+            continue
+        try:
+            hash = await redis.lpop(PRECACHE_Q_KEY)
+        except Exception:
+            await asyncio.sleep(3)
+            continue
         if hash is None:
             await asyncio.sleep(3) # Delay before checking again
             continue
         # See if already have this hash cached
-        have_pow = await app['redis'].get(hash)
+        have_pow = await redis_safe_get(app, hash)
         if have_pow is not None:
             continue # Already cached
         log.server_logger.info(f"precaching {hash}")
@@ -265,17 +341,13 @@ async def rpc(request):
     difficulty = requestjson.get('difficulty', SEND_DIFFICULTY)
     reward = requestjson.get('reward', True)
     # See if work is in cache
-    try:
-        work = await request.app['redis'].get(f"{requestjson['hash']}:{difficulty}")
-        if work is not None:
-            # Validate
-            try:
-                nanolib.validate_work(requestjson['hash'], work, difficulty=difficulty)
-                return web.json_response({"work":work})
-            except nanolib.InvalidWork:
-                pass
-    except Exception:
-        pass
+    work = await redis_safe_get(request.app, f"{requestjson['hash']}:{difficulty}")
+    if work is not None:
+        try:
+            nanolib.validate_work(requestjson['hash'], work, difficulty=difficulty)
+            return web.json_response({"work": work})
+        except nanolib.InvalidWork:
+            pass
     # Not in cache, request it from peers
     try:
         request.app['busy'] = True # Halts the precaching process
@@ -304,11 +376,16 @@ async def callback(request):
     if 'previous' not in block:
         log.server_logger.info(f"previous not in block from callback {str(block)}")
         return web.Response(status=200)
-    previous_pow = await request.app['redis'].get(block['previous'])
+    previous_pow = await redis_safe_get(request.app, block['previous'])
     if previous_pow is None:
         return web.Response(status=200) # They've never requested work from us before so we don't care
     else:
-        await request.app['redis'].rpush(PRECACHE_Q_KEY, hash)
+        redis = request.app.get('redis')
+        if redis is not None:
+            try:
+                await redis.rpush(PRECACHE_Q_KEY, hash)
+            except Exception:
+                pass
     return web.Response(status=200)
 
 ### END API
@@ -373,7 +450,7 @@ async def _fast_work_generate(hash: str) -> str:
     raise Exception(f"payout work_generate failed: {work_resp}")
 
 
-async def pay_and_notify(worker, hash: str):
+async def pay_and_notify(worker, hash: str, _attempt: int = 0):
     """Issue payout and notify worker. Fire-and-forget via ensure_future.
     worker is captured at submission time so payout works even if the worker
     has since disconnected. _payout_lock serialises sends so concurrent
@@ -383,17 +460,18 @@ async def pay_and_notify(worker, hash: str):
 
     # Natural idempotency key: worker_address:block_hash
     payout_key = f"{worker.kshs_address}:{hash}"
-    if payout_key in _idempotency_cache:
+    if _idempotency_get(payout_key) is not None:
         return
 
     req_id = str(uuid.uuid4())[:8]
     async with _payout_lock:
         # Re-check after acquiring lock (another coroutine may have completed it)
-        if payout_key in _idempotency_cache:
+        if _idempotency_get(payout_key) is not None:
             return
         try:
             log.server_logger.info(
                 f"[payout:{req_id}] sending {WORK_REWARD_KSHS} KSHS to {worker.kshs_address} for hash {hash}"
+                + (f" (retry {_attempt})" if _attempt > 0 else "")
             )
             tx_hash = await send_reward(
                 node_url=NODE_CONNSTR,
@@ -403,7 +481,7 @@ async def pay_and_notify(worker, hash: str):
                 amount_kshs=WORK_REWARD_KSHS,
                 work_generate_fn=_fast_work_generate,
             )
-            _idempotency_cache[payout_key] = tx_hash
+            _idempotency_set(payout_key, tx_hash)
             stats.record_completion(worker, WORK_REWARD_KSHS)
             log.server_logger.info(
                 f"[payout:{req_id}] paid {worker.kshs_address} — block {tx_hash}"
@@ -420,6 +498,32 @@ async def pay_and_notify(worker, hash: str):
         except Exception as e:
             log.server_logger.error(f"[payout:{req_id}] failed for {worker.kshs_address}: {e}")
             stats.record_completion(worker, 0)
+            # Fix 3: queue failed payout for retry
+            if _attempt < _PAYOUT_MAX_RETRIES:
+                _payout_retry_queue.append((worker, hash, _attempt + 1))
+                log.server_logger.info(
+                    f"[payout:{req_id}] queued retry {_attempt + 1}/{_PAYOUT_MAX_RETRIES} "
+                    f"for {worker.kshs_address}"
+                )
+
+
+async def _payout_retry_loop():
+    """Fix 3: Periodically retry failed payouts (every 60s)."""
+    while True:
+        await asyncio.sleep(60)
+        if not _payout_retry_queue:
+            continue
+        batch = []
+        while _payout_retry_queue:
+            batch.append(_payout_retry_queue.popleft())
+        for worker, hash, attempt in batch:
+            log.server_logger.info(
+                f"[payout-retry] retrying payout to {worker.kshs_address} "
+                f"for hash {hash} (attempt {attempt}/{_PAYOUT_MAX_RETRIES})"
+            )
+            await pay_and_notify(worker, hash, _attempt=attempt)
+        # Also run idempotency cleanup periodically
+        _idempotency_cleanup()
 
 
 async def handle_stats(request):
@@ -479,8 +583,10 @@ async def handle_admin_fund(request):
 
         # Idempotency: if key already processed, return cached result
         idempotency_key = body.get('idempotency_key')
-        if idempotency_key and idempotency_key in _idempotency_cache:
-            return web.json_response(_idempotency_cache[idempotency_key])
+        if idempotency_key:
+            cached = _idempotency_get(idempotency_key)
+            if cached is not None:
+                return web.json_response(cached)
 
         req_id = str(uuid.uuid4())[:8]
         log.server_logger.info(f"[req:{req_id}] admin_fund: {from_addr} -> {to_addr}, {amount_kshs} KSHS")
@@ -495,7 +601,7 @@ async def handle_admin_fund(request):
         )
         result = {'ok': True, 'hash': tx_hash, 'amount_kshs': str(amount_kshs)}
         if idempotency_key:
-            _idempotency_cache[idempotency_key] = result
+            _idempotency_set(idempotency_key, result)
         log.server_logger.info(f"[req:{req_id}] admin_fund complete: block {tx_hash}")
         return web.json_response(result)
     except Exception as e:
@@ -507,10 +613,12 @@ async def get_app():
     async def close_redis(app):
         """Close redis connection"""
         log.server_logger.info('Closing redis connection')
-        try:
-            app['redis'].close()
-        except Exception:
-            pass
+        redis = app.get('redis')
+        if redis is not None:
+            try:
+                redis.close()
+            except Exception:
+                pass
 
     async def open_redis(app):
         """Open redis connection"""
@@ -523,12 +631,18 @@ async def get_app():
             log.server_logger.warning('Could not connect to Redis, work caching and some other features will not work')
 
     async def init_queue(app):
-        """Initialize task queue"""
+        """Initialize task queue and payout retry loop"""
         app['precache_task'] = current_loop.create_task(precache_queue_process(app))
+        app['payout_retry_task'] = current_loop.create_task(_payout_retry_loop())
 
     async def clear_queue(app):
         app['precache_task'].cancel()
         await app['precache_task']
+        app['payout_retry_task'].cancel()
+        try:
+            await app['payout_retry_task']
+        except asyncio.CancelledError:
+            pass
 
     log_formatter = logging.Formatter(
         "%(asctime)s;%(levelname)s;%(message)s", "%Y-%m-%d %H:%M:%S %z"
@@ -603,10 +717,12 @@ def main():
         await work_app.cleanup()
         log.server_logger.info("Shutdown complete.")
 
+        # Fix 5: stop the loop after graceful shutdown finishes, not after 1s
+        current_loop.stop()
+
     def _signal_handler():
         log.server_logger.info("Received termination signal")
         asyncio.ensure_future(graceful_shutdown())
-        current_loop.call_later(1, current_loop.stop)
 
     # Register signal handlers for graceful shutdown
     for sig in (signal.SIGTERM, signal.SIGINT):

@@ -27,10 +27,11 @@ class Worker:
 class WorkerPool:
     def __init__(self, timeout: float = 30.0):
         self.workers: Dict[str, Worker] = {}
-        self._pending: Dict[str, tuple] = {}  # hash → (future, difficulty)
+        self._pending: Dict[str, asyncio.Future] = {}  # hash → future (in-flight dispatches)
+        self._pending_difficulty: Dict[str, str] = {}   # hash → difficulty
         self._winners: Dict[str, str] = {}    # hash → winning ws_id
         self._timeout = timeout
-        self._dispatch_lock = asyncio.Lock()  # serialize dispatches so miners don't cancel each other
+        self._pending_lock = asyncio.Lock()  # short lock around _pending dict mutations only
 
     async def add(self, ws, kshs_address: str) -> str:
         ws_id = str(uuid.uuid4())
@@ -44,43 +45,60 @@ class WorkerPool:
 
     async def dispatch(self, hash: str, difficulty: str) -> Optional[str]:
         """
-        Push work task to connected workers, one task at a time.
-        The dispatch lock ensures miners don't receive a new task while
-        still computing the previous one (which would cancel it).
-        Returns first valid work string, or None if pool empty or timeout.
+        Push work task to connected workers.  Multiple different hashes
+        can be computed concurrently.  If the same hash is already being
+        dispatched, callers coalesce onto the existing future.
+
+        A short lock (_pending_lock) is held only while mutating the
+        _pending dict -- never during the full wait_for duration.
         """
         if not self.workers:
             return None
 
-        async with self._dispatch_lock:
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future = loop.create_future()
-            self._pending[hash] = (future, difficulty)
+        # Fast path: if this hash is already in flight, just await it
+        async with self._pending_lock:
+            existing = self._pending.get(hash)
+            if existing is not None:
+                future = existing
+            else:
+                loop = asyncio.get_running_loop()
+                future = loop.create_future()
+                self._pending[hash] = future
+                self._pending_difficulty[hash] = difficulty
 
+        # Only broadcast to workers if we created a new future
+        if existing is None:
             task_msg = {'action': 'work', 'hash': hash, 'difficulty': difficulty}
             for worker in list(self.workers.values()):
                 try:
                     await worker.ws.send_json(task_msg)
                 except Exception as e:
                     logger.warning(f"Failed to send task to {worker.ws_id}: {e}")
+                    # Fix 4: remove dead worker on send failure
+                    self.workers.pop(worker.ws_id, None)
+                    logger.info(f"Removed dead worker {worker.ws_id} from pool after send failure")
 
-            try:
-                result = await asyncio.wait_for(future, timeout=self._timeout)
-                return result
-            except asyncio.TimeoutError:
-                logger.warning(f"Worker pool timed out for hash {hash}")
-                return None
-            finally:
-                self._pending.pop(hash, None)
-                winner_id = self._winners.pop(hash, None)
-                cancel_msg = {'action': 'cancel', 'hash': hash}
-                for worker in list(self.workers.values()):
-                    if worker.ws_id == winner_id:
-                        continue
-                    try:
-                        await worker.ws.send_json(cancel_msg)
-                    except Exception:
-                        pass
+        try:
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=self._timeout)
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Worker pool timed out for hash {hash}")
+            return None
+        finally:
+            # Clean up only if we are the originator of this future
+            async with self._pending_lock:
+                if self._pending.get(hash) is future:
+                    self._pending.pop(hash, None)
+                    self._pending_difficulty.pop(hash, None)
+            winner_id = self._winners.pop(hash, None)
+            cancel_msg = {'action': 'cancel', 'hash': hash}
+            for worker in list(self.workers.values()):
+                if worker.ws_id == winner_id:
+                    continue
+                try:
+                    await worker.ws.send_json(cancel_msg)
+                except Exception:
+                    pass
 
     async def submit(self, ws_id: str, hash: str, work: str) -> bool:
         """
@@ -88,15 +106,15 @@ class WorkerPool:
         Validates work via nanolib. Resolves the pending Future if first valid result.
         Returns True if this worker won, False otherwise.
         """
-        entry = self._pending.get(hash)
-        if entry is None:
+        future = self._pending.get(hash)
+        if future is None:
             return False
-        future, req_difficulty = entry
         if future.done():
             return False
 
+        req_difficulty = self._pending_difficulty.get(hash)
         try:
-            if nanolib is not None:
+            if nanolib is not None and req_difficulty is not None:
                 nanolib.validate_work(hash, work, difficulty=req_difficulty)
         except Exception as e:
             logger.warning(f"Invalid work from {ws_id}: {e}")
