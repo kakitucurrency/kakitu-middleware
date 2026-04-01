@@ -29,6 +29,7 @@ class WorkerPool:
         self._pending: Dict[str, tuple] = {}  # hash → (future, difficulty)
         self._winners: Dict[str, str] = {}    # hash → winning ws_id
         self._timeout = timeout
+        self._dispatch_lock = asyncio.Lock()  # serialize dispatches so miners don't cancel each other
 
     async def add(self, ws, kshs_address: str) -> str:
         ws_id = str(uuid.uuid4())
@@ -42,40 +43,43 @@ class WorkerPool:
 
     async def dispatch(self, hash: str, difficulty: str) -> Optional[str]:
         """
-        Push work task to all connected workers.
+        Push work task to connected workers, one task at a time.
+        The dispatch lock ensures miners don't receive a new task while
+        still computing the previous one (which would cancel it).
         Returns first valid work string, or None if pool empty or timeout.
         """
         if not self.workers:
             return None
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._pending[hash] = (future, difficulty)
+        async with self._dispatch_lock:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future = loop.create_future()
+            self._pending[hash] = (future, difficulty)
 
-        task_msg = {'action': 'work', 'hash': hash, 'difficulty': difficulty}
-        for worker in list(self.workers.values()):
-            try:
-                await worker.ws.send_json(task_msg)
-            except Exception as e:
-                logger.warning(f"Failed to send task to {worker.ws_id}: {e}")
-
-        try:
-            result = await asyncio.wait_for(future, timeout=self._timeout)
-            return result
-        except asyncio.TimeoutError:
-            logger.warning(f"Worker pool timed out for hash {hash}")
-            return None
-        finally:
-            self._pending.pop(hash, None)
-            winner_id = self._winners.pop(hash, None)
-            cancel_msg = {'action': 'cancel', 'hash': hash}
+            task_msg = {'action': 'work', 'hash': hash, 'difficulty': difficulty}
             for worker in list(self.workers.values()):
-                if worker.ws_id == winner_id:
-                    continue
                 try:
-                    await worker.ws.send_json(cancel_msg)
-                except Exception:
-                    pass
+                    await worker.ws.send_json(task_msg)
+                except Exception as e:
+                    logger.warning(f"Failed to send task to {worker.ws_id}: {e}")
+
+            try:
+                result = await asyncio.wait_for(future, timeout=self._timeout)
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(f"Worker pool timed out for hash {hash}")
+                return None
+            finally:
+                self._pending.pop(hash, None)
+                winner_id = self._winners.pop(hash, None)
+                cancel_msg = {'action': 'cancel', 'hash': hash}
+                for worker in list(self.workers.values()):
+                    if worker.ws_id == winner_id:
+                        continue
+                    try:
+                        await worker.ws.send_json(cancel_msg)
+                    except Exception:
+                        pass
 
     async def submit(self, ws_id: str, hash: str, work: str) -> bool:
         """
